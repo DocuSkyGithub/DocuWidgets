@@ -30,12 +30,25 @@
  * 0.18 (May 4 2019) fix retry problem when server improperly return a non-JSON
  * 0.19 (May 18 2019) add extra DocuSky links to widget display
  * 0.20 (June 06 2019) remove the dependency of jQuery UI
+ * 0.21 (July 12 2019) modify setLoadingIcon() to support more options
+ * 0.22 (Sept 21 2020) fix provider change bug (add urlWebApiPath)
+ * 0.23 (Jan 26 2021) add SessionKey to pass session key via url parameter
+ * 0.24 (June 14 2021) expose login() as public function, add public logout(), and fix bugs
+ * 0.25 (July 02 2021) add request param to DocuSky API, add setRequester(), and fix bugs (encodeURIComponent(query))
+ * 0.26 (Dec 30 2021) minor fix (add const parameter forceHttps), reset SessionKey after logout
+ * 0.27 (Feb 11 2022) add var ForceHttps, WithCredentials (since may include multiple widgets, cannot use 'const' here), fix hideWidget()
+ *
  * @copyright
  * Copyright (C) 2016-2019 Hsieh-Chang Tu
  *
  * @license
  *
  */
+
+var ForceHttps = false;                   // 2021-12-20: 若放到 server 上，可能需設為 true（避免 BigIP 將 http 轉為 https 時沒有帶上 CORS 所需的 headers）
+var WithCredentials = true;               // 2022-02-10: 若放到 server 上，可能需設為 false（避免瀏覽器不接受 Access-Control-Allow-Origin:* -- 但瀏覽器在登入時會顯示「不安全」訊息）
+
+var SessionKey;                           // 2021-02-06: 必須是全域變數，才能在 widgets 之間共用（且僅宣告而不指定值）
 
 if (window.navigator.userAgent.indexOf("MSIE ") > 0) {
    alert("抱歉，DocuSky 工具目前只支援 Firefox 與 Chrome");
@@ -45,7 +58,7 @@ var ClsDocuskyGetDbCorpusDocumentsSimpleUI = function(param) {     // class (con
    var me = this;
 
    this.package = 'docusky.ui.getDbCorpusDocumentsSimpleUI.js';    // 主要目的：取得給定 db, corpus 的文件
-   this.version = 0.19;                             // 2019-05-18
+   this.version = 0.25;                             // 2021-07-02
    this.idPrefix = 'CorpusDoc_';                    // 2016-08-13
 
    this.showPublicDbLink = true;                    // 2018-09-30, 2018-10-15
@@ -53,7 +66,7 @@ var ClsDocuskyGetDbCorpusDocumentsSimpleUI = function(param) {     // class (con
 
    this.utility = null;
    this.protocol = null;                            // 'http',
-   this.urlScriptPath = null;
+   this.urlHostPath = null;
    this.urlWebApiPath = null;
    this.urlLogin = null;
    this.urlGetDbCorpusListJson = null;
@@ -75,6 +88,7 @@ var ClsDocuskyGetDbCorpusDocumentsSimpleUI = function(param) {     // class (con
    this.corpus = '';
    this.query = '';                                 // 儲存最後一個 query
    this.fieldsOnly = undefined;                     // 2018-09-14
+   this.requester = 'Widget:getDbCorpusDocuments';  // 2021-06-24: 預設值，呼叫者可覆蓋（修改起來頗繁瑣，目前只是先加進此變數）
 
    this.loadingIconWidth = 140;                     // 2017-06-19: size of the loading image
    this.displayLoadingIcon = true;                  // 2017-07-13
@@ -83,7 +97,7 @@ var ClsDocuskyGetDbCorpusDocumentsSimpleUI = function(param) {     // class (con
    // login action
    this.loginInvokeFun = null;
    //this.loginInvokeFunParameters = null;
-
+   
    // returns
    this.totalFound = 0;
    this.page = 1;
@@ -106,6 +120,12 @@ var ClsDocuskyGetDbCorpusDocumentsSimpleUI = function(param) {     // class (con
    if (typeof(param)=='object' && 'target' in param) {
       me.target = (param.target.toUpperCase() == 'OPEN') ? 'OPEN' : 'USER';
    }
+   
+   // a small set of default loading icons
+   this.loadingIconSet = [ 'loading-circle.gif', 'loading-circle-gray.gif',
+                           'loading-gears-blue.gif', 'loading-blueball.gif'];
+   this.loadingIconIdx = 0;
+   this.loadingIconMessageType = 0;            // 2019-07-12: 0: default (page n), 1: fetched/total
 
    // =================================
    //       main functions
@@ -113,10 +133,12 @@ var ClsDocuskyGetDbCorpusDocumentsSimpleUI = function(param) {     // class (con
 
    var init = function() {
       let scheme = location.protocol.substr(0, location.protocol.length-1);
-      if (scheme == 'file') me.urlScriptPath = "https://docusky.org.tw/docusky";
-      else me.urlScriptPath = me.utility.dirname(me.utility.dirname(me.scriptPath + 'dummy'));
-      me.urlWebApiPath = me.urlScriptPath + '/WebApi';
-      let pathParts = me.urlScriptPath.match(/(http[s]?):\/\/([^\/]+)\/(.*)/);
+      if (scheme == 'file') me.urlHostPath = "https://docusky.org.tw/docusky";
+      else me.urlHostPath = me.utility.dirname(me.utility.dirname(me.scriptPath + 'dummy'));
+      if (ForceHttps && scheme == 'http') scheme = 'https';             // 2021-12-20: 強迫改用 https
+
+      me.urlWebApiPath = me.urlHostPath + '/WebApi';
+      let pathParts = me.urlHostPath.match(/(http[s]?):\/\/([^\/]+)\/(.*)/);
       let pos = me.urlWebApiPath.split('/', 3).join('/').length;
       let [urlHost, urlPort] = pathParts[2].split(':');
       let urlPath = me.urlWebApiPath.substr(pos);
@@ -170,7 +192,7 @@ var ClsDocuskyGetDbCorpusDocumentsSimpleUI = function(param) {     // class (con
       $("#" + loginContainerId).hide();
 
       $("#" + loginSubmitId).click(function(e) {
-         login($("#" + dsUsernameId).val(), $("#" + dsPasswordId).val());
+         me.login($("#" + dsUsernameId).val(), $("#" + dsPasswordId).val());
       });
       $("#" + closeLoginButtonId).click(function(e) {
          $("#" + closeProviderListButtonId).click();           // close provider window
@@ -244,17 +266,20 @@ var ClsDocuskyGetDbCorpusDocumentsSimpleUI = function(param) {     // class (con
 
 	   $("#" + logoutDBId).click(function(e) {
          e.preventDefault();
-         $.ajaxSetup({xhrFields: {withCredentials: true}});
-         $.get(me.urlLogout, function(jsonObj) {
+         $.ajaxSetup({xhrFields: {withCredentials: WithCredentials}});
+         let url = me.urlLogout + "?requester=" + me.requester      // 2021-06-24
+                 + ((SessionKey) ? ("&" + SessionKey) : "");        // 2021-02-06
+         $.get(url, function(jsonObj) {
             //me.utility.displayJson(jsonObj);
             if (jsonObj.code == 0) {         // successfully logged out
                alert("Successfully logged out");
+               SessionKey = 'NONE';              // 2021-12-30
             }
             else {
                alert(jsonObj.code + ': ' + jsonObj.message);
             }
-      			$("#" + dbCorpusListContainerOverlayId).show();
-      			$("#" + dbCorpusListContainerId).fadeOut();
+            $("#" + dbCorpusListContainerOverlayId).show();
+            $("#" + dbCorpusListContainerId).fadeOut();
          }, 'json')
          .fail(function (jqXHR, textStatus, errorThrown){
            if (jqXHR.status=="200") {          // 2019-05-07: server return not correct json
@@ -306,13 +331,11 @@ var ClsDocuskyGetDbCorpusDocumentsSimpleUI = function(param) {     // class (con
 
       // loadingContainer
       var loadingContainerId = me.idPrefix + "loadingContainer" + me.uniqueId;
-      var loadingSignId = me.idPrefix + "loadingSign" + me.uniqueId;
       var workingProgressId = me.idPrefix + "workingProgressId" + me.uniqueId;
-      var s = "<div id='" + loadingContainerId + "' style='position:absolute; border:3px grey solid; border-radius:6px; background-color:white; font-size:medium; z-index:1003;'>" +
-              "<div id='" + loadingSignId + "'>" +
-              "<img src='" + me.urlWebApiPath + "/images/loading-circle.gif' width='" + me.loadingIconWidth + "' border='0'/>" +
-              "</div>" +
-              "<div id='" + workingProgressId + "' style='position:absolute; top:60px; width:100%; text-align:center;'></div>" +
+      var loadingIcon = me.loadingIconSet[me.loadingIconIdx];
+      var s = "<div id='" + loadingContainerId + "' class='dsw-loadingIcon'>" +
+              "<img id='dsLoadingIcon' src='" + me.urlWebApiPath + "/images/loading/" + loadingIcon + "' width='" + me.loadingIconWidth + "' border='0'/>" +
+              "<div id='" + workingProgressId + "' class='dsw-progressMessage' style='position:absolute; top:60px; left:20%; width:60%; text-align:center;'></div>" +
               "</div>";
       $("html").append(s);
       $("#" + loadingContainerId).hide();
@@ -320,7 +343,8 @@ var ClsDocuskyGetDbCorpusDocumentsSimpleUI = function(param) {     // class (con
       // 2018-10-12: set provider list
       if (me.enableGetProviderList) {
          // location.procotol contains ':'
-         let url = me.urlGetProviderListJson + "?scheme=http,https";
+         let url = me.urlGetProviderListJson + "?scheme=http,https&requester=" + me.requester;      // 2021-06-24
+         url += (SessionKey) ? ("&" + SessionKey) : "";         // 2021-02-06
          $.ajax({ url: url, method: "GET"})
             .done(function(retObj) {
                if (retObj.code == 0) {
@@ -347,9 +371,9 @@ var ClsDocuskyGetDbCorpusDocumentsSimpleUI = function(param) {     // class (con
                //setUrlApiPath(me, me.providerList[1]);     // test
             })
             .fail(function(jqXHR, textStatus) {
-              console.error("Connection Error");
+              console.error("Connection Error: " + url);    // 2020-10-08: local test 會跑出 connection error?
               if(typeof me.Error === "function"){
-                 me.Error("Connection Error");
+                 me.Error("Connection Error: " + url);
               }
               else{
                 alert("Connection Error");
@@ -366,6 +390,7 @@ var ClsDocuskyGetDbCorpusDocumentsSimpleUI = function(param) {     // class (con
       me.channelBuffer = {};
       me.initialized = true;
    };
+   
    var setUrlApiPath = function(obj, provider) {                // 2018-10-12
       if (provider.urlScheme == 'https') {
          var port = (provider.urlPort != "443") ? (":" + provider.urlPort) : ":443";
@@ -381,6 +406,7 @@ var ClsDocuskyGetDbCorpusDocumentsSimpleUI = function(param) {     // class (con
       var urlApiPath = provider.urlScheme + "://" + provider.urlHost + port + provider.urlPath;
       //alert("SET API PATH: " + urlApiPath);
 
+      obj.urlWebApiPath = urlApiPath;                     // 2020-09-21: bug fix (e.g., to allow invokers to connect to retrieval page directly)
       obj.urlLogin = urlApiPath + '/userLoginJson.php';
       obj.urlLogout = urlApiPath + '/userLogoutJson.php';
       obj.urlGetDbCorpusListJson =  urlApiPath + '/getDbCorpusListJson.php';
@@ -394,119 +420,7 @@ var ClsDocuskyGetDbCorpusDocumentsSimpleUI = function(param) {     // class (con
       obj.curProvider = JSON.parse(JSON.stringify(provider));    // copy content
       $(".dsw-span-provider").html(provider.title);
    };
-
-   var login = function(username, password) {
-      //$.ajaxSetup({async:false});
-      //var postdata = { dsgUname: username, dsgPword: password };     // camel style: to get dbCorpusDocuments
-      //$.post("../DocuGate/webApi/userDispatcherLoginJson.php", postdata, function(jsonObj) {
-      var postdata = { dsUname: username, dsPword: password };     // camel style: to get dbCorpusDocuments
-      $.post(me.urlLogin, postdata, function(jsonObj) {
-         //me.utility.displayJson(jsonObj);
-         var loginMessageId = me.idPrefix + "loginMessage" + me.uniqueId;
-         var loginContainerOverlayId = me.idPrefix + "loginContainerOverlay" + me.uniqueId;
-         var loginContainerId = me.idPrefix + "loginContainer" + me.uniqueId;
-         if (jsonObj.code == 0) {               // successfully login
-            $("#" + loginMessageId).empty();    // 成功登入，清除（先前可能有的）訊息
-            $("#" + loginContainerOverlayId).show();
-            $("#" + loginContainerId).fadeOut();
-            // 登入後，就自動載入第一頁的內容... 日後該改為可由工具自行設定
-            if (typeof me.loginInvokeFun === "function") {
-               me.loginInvokeFun();
-            }
-            else {
-               me.target = 'USER';              // 2018-10-02
-               //me.getDbCorpusDocuments(me.target, me.db, me.corpus, me.callerEvent, me.callerCallback, me.callerCallbackParameters);
-               // 2018-09-15
-               var param = { target: me.target,
-                             ownerUsername: me.ownerUsername,  // 2019-04-21
-                             db: me.db,
-                             corpus: me.corpus,
-                             page: me.page,
-                             pageSize: me.pageSize,            // 2018-09-18: fix bug (misspelled "pageSizde")
-                             fieldsOnly: me.fieldsOnly,
-                             };
-               //alert(JSON.stringify(param));
-               me.getQueryResultDocuments(param, me.callerEvent, me.callerCallback);
-
-            }
-         }
-         else if (jsonObj.code == 101) ;   // alert("Login fails: requires login");       // Requires login
-         else {
-           console.error("Login Error");
-           if(typeof me.Error === "function"){
-             me.Error("Login Error");
-           }
-           else {
-              $("#" + loginMessageId).html(jsonObj.code + ': ' + jsonObj.message);    // jsonObj.code == 101 ==> Requires login
-           }
-         }
-      }, 'json')
-      .fail(function (jqXHR, textStatus, errorThrown){
-          if (jqXHR.status=="200") {          // 2019-05-04: server return not correct json
-             alert("Server response seems not a valid JSON");
-             return;
-          }
-          if(jqXHR.status=="404" || jqXHR.status=="403"){
-            console.error("Server Error");
-          }
-          else{
-            console.error("Connection Error");
-          }
-         if(typeof me.Error === "function"){
-           if(jqXHR.status=="404" || jqXHR.status=="403"){
-             me.Error("Server Error");
-           }
-           else{
-             me.Error("Connection Error");
-           }
-         }
-         else{
-
-          let loginMessageId = me.idPrefix + "loginMessage" + me.uniqueId;
-          let loginContainerId = me.idPrefix + "loginContainer" + me.uniqueId;
-          $("#" + loginContainerId).show();
-          if(jqXHR.status=="404" || jqXHR.status=="403"){
-            $("#" + loginMessageId).html("Server Error");
-          }
-          else{
-            if(me.presentRetryCount < me.maxRetryCount){
-              me.presentRetryCount++;
-              $("#" + loginMessageId).html("Connection Error");
-              let retry = function(){
-                login(username, password);
-              }
-              setTimeout(retry,3000);
-            }
-            else{
-              $("#" + loginMessageId).html("Please check your Internet connection and refresh this page.");
-            }
-
-          }
-
-
-         }
-
-      });
-      //$.ajaxSetup({async:true});
-   };
-
-   // -------------- object "public" functions ---------
-   me.addExtraApiFunctions = function(func) {        // e.g., add extra/docusky.dbRefdataAPI.js
-      if (typeof func === 'function') func(me);
-      else alert("Argument of addExtraFunctions() must be a function");
-   };
-
-   // 2019-04-24
-   me.setLoadingIcon = function(url){
-     let loadingSignId = me.idPrefix + "loadingSign" + me.uniqueId;
-     $("#"+loadingSignId+" img").attr("src", url);
-   };
-
-   /*me.setLoginAction = function(loginInvokeFun, loginInvokeFunParameters) {
-      me.loginInvokeFun = loginInvokeFun;
-      me.loginInvokeFunParameters = loginInvokeFunParameters;
-   }*/
-
+   
    var displayDbCorpusList = function(param, evt) {          // list all db/corpus pairs (not the corpuses under a given db)
       // add the mechanism of inadvertent error prevention on UI display
       if(!evt && me.displayWidget){
@@ -532,10 +446,12 @@ var ClsDocuskyGetDbCorpusDocumentsSimpleUI = function(param) {     // class (con
       var invokeFunName = param.invokeFunName;
 
       //$.ajaxSetup({async:false});
-      $.ajaxSetup({xhrFields: {withCredentials: true}});
-      let friendDb = (me.includeFriendDb) ? '&includeFriendDb=1' : '';
-      let url = me.urlGetDbCorpusListJson + '?' + 'target=' + displayTarget + friendDb;
+      $.ajaxSetup({xhrFields: {withCredentials: WithCredentials}});
+      let friendDb = (me.includeFriendDb || param.includeFriendDb) ? '&includeFriendDb=1' : '';    // 2021-06-13: 加上 param.includeFriendDb
+      let url = me.urlGetDbCorpusListJson + '?' + 'target=' + displayTarget + friendDb + '&requester=' + me.requester;
+      url += (SessionKey) ? ("&" + SessionKey) : "";        // 2021-02-06
       //alert(url);
+      
       $.get(url, function(data) {
          $("#" + loadingContainerId).hide();
          if (data.code == 0) {          // success
@@ -597,14 +513,14 @@ var ClsDocuskyGetDbCorpusDocumentsSimpleUI = function(param) {     // class (con
 
             $("#openDocuSkyHome").unbind("click").click(function(e) {     // 2019-05-18
                var url = (e.altKey)
-                       ? me.urlScriptPath + "/ds-v1-01.home.html"
+                       ? me.urlHostPath + "/ds-v1-01.home.html"
                        : "https://docusky.org.tw";
                window.open(url, "_blank");
             });
 
             $("#openMyDatabases").unbind("click").click(function(e) {     // 2019-05-18
                var url = (e.altKey)
-                       ? me.urlScriptPath + "/userMainPage.php"
+                       ? me.urlHostPath + "/userMainPage.php"
                        : "https://docusky.org.tw/docusky/docuTools/UserMain/index.html";
                window.open(url, "_blank");
             });
@@ -784,6 +700,247 @@ var ClsDocuskyGetDbCorpusDocumentsSimpleUI = function(param) {     // class (con
       jelement.css({top: evt.pageX, left: evt.pageY, position:'absolute'});
 		$("#" + providerListContainerOverlayId).hide();
    };
+   
+   // -------------- object "public" functions ---------
+
+   me.login = function(username, password, succFunc, failFunc) {        // 2021-06-13: 改 public, 加上 succFunc
+      //$.ajaxSetup({async:false});
+      //var postdata = { dsgUname: username, dsgPword: password };      // camel style: to get dbCorpusDocuments
+      //$.post("../DocuGate/webApi/userDispatcherLoginJson.php", postdata, function(jsonObj) {
+      var postdata = { dsUname: username,                               // camel style: to get dbCorpusDocuments
+                       dsPword: password,
+                       requester: me.requester };     
+      $.ajaxSetup({xhrFields: {withCredentials: WithCredentials}});     // 2018-01-30: must add this for later CORS requests
+      $.post(me.urlLogin, postdata, function(jsonObj) {
+         //me.utility.displayJson(jsonObj);
+         var loginMessageId = me.idPrefix + "loginMessage" + me.uniqueId;
+         var loginContainerOverlayId = me.idPrefix + "loginContainerOverlay" + me.uniqueId;
+         var loginContainerId = me.idPrefix + "loginContainer" + me.uniqueId;
+         if (jsonObj.code == 0) {               // successfully login
+            // 2022-02-10: 應在 succ callback 前設定 SessionKey!
+            SessionKey = jsonObj.message;       // 2021-02-06: message 將包含 session key 訊息 -- getQueryResultDocuments() 會用到（放入 url parameter）
+            
+            $("#" + loginMessageId).empty();    // 成功登入，清除（先前可能有的）訊息
+            $("#" + loginContainerOverlayId).show();
+            $("#" + loginContainerId).fadeOut();
+            
+            if (typeof succFunc === "function") succFunc(jsonObj.message);
+            //else if (typeof me.loginInvokeFun === "function") me.loginInvokeFun(jsonObj);  // 登入後，就自動載入第一頁的內容... 日後該改為可由工具自行設定
+            else {
+               me.target = 'USER';              // 2018-10-02
+               //me.getDbCorpusDocuments(me.target, me.db, me.corpus, me.callerEvent, me.callerCallback, me.callerCallbackParameters);
+               // 2018-09-15
+               var param = { target: me.target,
+                             ownerUsername: me.ownerUsername,  // 2019-04-21
+                             db: me.db,
+                             corpus: me.corpus,
+                             page: me.page,
+                             pageSize: me.pageSize,            // 2018-09-18: fix bug (misspelled "pageSizde")
+                             fieldsOnly: me.fieldsOnly,
+                             requester: me.requester,          // 2021-06-24
+                             };
+               //alert(JSON.stringify(param));
+               me.getQueryResultDocuments(param, me.callerEvent, me.callerCallback);
+            }
+         }
+         else if (jsonObj.code == 101) ;   // alert("Login fails: requires login");       // Requires login
+         else {
+           console.error("Login Error");
+           if(typeof me.Error === "function"){
+             me.Error("Login Error");
+           }
+           else {
+              $("#" + loginMessageId).html(jsonObj.code + ': ' + jsonObj.message);    // jsonObj.code == 101 ==> Requires login
+           }
+         }
+      }, 'json')
+      .fail(function (jqXHR, textStatus, errorThrown){
+          if (jqXHR.status=="200") {          // 2019-05-04: server return not correct json
+             alert("Server response seems not a valid JSON");
+             return;
+          }
+          if(jqXHR.status=="404" || jqXHR.status=="403"){
+            console.error("Server Error");
+          }
+          else{
+            console.error("Connection Error");
+          }
+         if(typeof me.Error === "function"){
+           if(jqXHR.status=="404" || jqXHR.status=="403"){
+             me.Error("Server Error");
+           }
+           else{
+             me.Error("Connection Error");
+           }
+         }
+         else{
+
+          let loginMessageId = me.idPrefix + "loginMessage" + me.uniqueId;
+          let loginContainerId = me.idPrefix + "loginContainer" + me.uniqueId;
+          $("#" + loginContainerId).show();
+          if(jqXHR.status=="404" || jqXHR.status=="403"){
+            $("#" + loginMessageId).html("Server Error");
+          }
+          else{
+            if(me.presentRetryCount < me.maxRetryCount){
+              me.presentRetryCount++;
+              $("#" + loginMessageId).html("Connection Error");
+              let retry = function(){
+                me.login(username, password);
+              }
+              setTimeout(retry,3000);
+            }
+            else{
+              $("#" + loginMessageId).html("Please check your Internet connection and refresh this page.");
+            }
+          }
+         }
+      });
+      //$.ajaxSetup({async:true});
+   };
+
+   me.logout = function(succFunc) {                                             // 2021-06-14
+      $.ajaxSetup({xhrFields: {withCredentials: WithCredentials}});
+      let url = me.urlLogout + ((SessionKey) ? ("?" + SessionKey) : "");        // 2021-02-06
+      $.get(url, function(jsonObj) {
+         var filenameListContainerId = me.idPrefix + "filenameListContainer" + me.uniqueId;
+         if (jsonObj.code == 0) {         // successfully logged out
+            $("#" + filenameListContainerId).fadeOut();
+            if (typeof succFunc === "function") succFunc(jsonObj.message);      // 2021-06-14
+            else alert("Successfully logged out");
+            SessionKey = 'NONE';              // 2021-12-30
+         }
+         else {
+            $("#" + filenameListContainerId).fadeout();
+            alert(jsonObj.code + ': ' + jsonObj.message);
+         }
+         me.hideWidget();       // 2021-12-30: 隱藏 widget 但不設定 displayWidget 變數
+      }, 'json')
+      .fail(function (jqXHR, textStatus, errorThrown){
+        if (jqXHR.status=="200") {          // 2019-05-07: server return not correct json
+           alert("Server response seems not a valid JSON");
+           return;
+        }
+        if(jqXHR.status=="404" || jqXHR.status=="403"){
+          console.error("Server Error");
+        }
+        else{
+          console.error("Connection Error");
+        }
+         if (typeof failFunc === "function") {
+            failFunc();
+         }
+         else if(typeof me.Error === "function"){
+           if(jqXHR.status=="404" || jqXHR.status=="403"){
+             me.Error("Server Error");
+           }
+           else{
+             me.Error("Connection Error");
+           }
+         }
+         else{
+           if(jqXHR.status=="404" || jqXHR.status=="403"){
+             alert("Server Error");
+           }
+           else{
+             if(me.presentRetryCount < me.maxRetryCount){
+               me.presentRetryCount++;
+               alert("Connection Error");
+             }
+             else{
+               alert("Please check your Internet connection and refresh this page.");
+             }
+
+           }
+         }
+
+      });
+   };
+
+   me.addExtraApiFunctions = function(func) {        // e.g., add extra/docusky.dbRefdataAPI.js
+      if (typeof func === 'function') func(me);
+      else alert("Argument of addExtraFunctions() must be a function");
+   };
+   
+   me.setRequester = function(requester) {           // 2021-06-24: 由呼叫者設定 requester 名稱
+      if (requester) me.requester = requester;
+   };
+
+   /*me.setLoginAction = function(loginInvokeFun, loginInvokeFunParameters) {
+      me.loginInvokeFun = loginInvokeFun;
+      me.loginInvokeFunParameters = loginInvokeFunParameters;
+   }*/
+
+   // --------------------------------------------------------------------------------------
+
+   // 2021-06-13
+   me.getAccessibleDbCorpusList = function(param, succFunc, failFunc) {
+      let friendDb = (param.includeFriendDb) ? '&includeFriendDb=1' : '';
+      let url = me.urlGetDbCorpusListJson + '?' + 'target=USER' + friendDb + '&requester=' + me.requester;
+      url += (SessionKey) ? ("&" + SessionKey) : "";        // 2021-02-06
+      //let data = "friendAccessibleDb=" + JSON.stringify(friendAccessibleDb);
+      let data = "";
+      $.ajax({
+         method: 'POST',
+         url: url,
+         data: data
+      }).done(function(data) {
+         if (data.code == 0) {
+            if (typeof succFunc === "function") succFunc(data.message);
+            else alert("getMyAccessibleDbCorpusList:\n" + JSON.stringify(data.message));
+         }
+         else {
+             console.error("Server Error");
+             if (typeof failFunc === "function"){
+               failFunc(data);
+             }
+             else if(typeof me.Error === "function"){
+               me.Error("Server Error");
+             }
+             else {
+               alert("deleteUserFriendAccessibleDb: " + data.message);
+             }
+         }
+      }).fail(function(jqXHR, textStatus, errorThrown) {
+        if(jqXHR.status=="404" || jqXHR.status=="403"){
+          console.error("Server Error");
+        }
+        else{
+          console.error("Connection Error");
+        }
+        if (typeof failFunc === "function") {
+           failFunc();
+        }
+        else if(typeof me.Error === "function"){
+            if(jqXHR.status=="404" || jqXHR.status=="403"){
+              me.Error("Server Error");
+            }
+            else{
+              me.Error("Connection Error");
+            }
+        }
+        else{
+          if(jqXHR.status=="404" || jqXHR.status=="403"){
+            alert("Server Error");
+          }
+          else{
+            if(me.presentRetryCount < me.maxRetryCount){
+              me.presentRetryCount++;
+              alert("Connection Error");
+              let retry = function(){
+                me.deleteUserFriendAccessibleDb(param, succFunc, failFunc);
+              }
+              setTimeout(retry,3000);
+            }
+            else{
+              alert("Please check your Internet connection and refresh this page.");
+            }
+          }
+        }
+      });
+   }
+
+   // --------------------------------------------------------------------------------------
 
    me.getDbCorpusDocuments = function(target, db, corpus, evt, succFunc, failFunc) {
       var param = { 'target': target,
@@ -792,7 +949,9 @@ var ClsDocuskyGetDbCorpusDocumentsSimpleUI = function(param) {     // class (con
                     'corpus': corpus,
                     'query': '.all',
                     'page': 1,
-                    'pageSize': me.pageSize };
+                    'pageSize': me.pageSize,
+                    'requester': me.requester,
+                    };
       me.getQueryResultDocuments(param, evt, succFunc, failFunc);
    };
 
@@ -800,7 +959,7 @@ var ClsDocuskyGetDbCorpusDocumentsSimpleUI = function(param) {     // class (con
    // 2016-08-30(pykenny): fix problem when argument 'message' is not given
    // note: me function does not support "callback parameters" (for backward compatibility)
    me.getDbCorpusDocumentsGivenPageAndSize = function(target, db, corpus, page, pageSize, evt, succFunc, message, failFunc) {
-     me.pageSize = pageSize;
+      me.pageSize = pageSize;
 	   var msg = "";
 	   // reset links got by init(): urlGetDbCorpusListJson.php
       $(".loadDbCorpusDocument").each(function(idx){
@@ -837,9 +996,10 @@ var ClsDocuskyGetDbCorpusDocumentsSimpleUI = function(param) {     // class (con
       me.displayLoadingIcon = (bool === false);
    };
 
-   me.hideWidget = function(bool) {
-      me.displayWidget = (bool === false);
-      if (!me.displayWidget) {
+   me.hideWidget = function(setVar = false, bool = true) {        // 2021-12-30: 加入 setVar，登出時雖然需隱藏 widget，但不應設定 displayWidget 為 false
+      // 2022-02-10: 將 setVar 改放在第一個參數（預設是 false -- 僅關閉視窗，不設定 displayWidget）
+      if (setVar) me.displayWidget = (bool === false);
+      if (bool || !me.displayWidget) {
          //var dbCorpusListContainerId = me.idPrefix + "dbCorpusListContainer" + me.uniqueId;
          //$("#" + dbCorpusListContainerId).hide();
          //var loginContainerId = me.idPrefix + "loginContainer" + me.uniqueId;
@@ -849,9 +1009,10 @@ var ClsDocuskyGetDbCorpusDocumentsSimpleUI = function(param) {     // class (con
    };
 
    me.getQueryResultDocuments = function(param, evt, succFunc, failFunc) {
-   //original me.getQueryResultDocuments = function(param, evt, successFunc, successFuncParameters)
+      //original me.getQueryResultDocuments = function(param, evt, successFunc, successFuncParameters)
       var my = null;
 
+      //alert('getQueryResultDocuments(): \n' + JSON.stringify(param));
       if (typeof(param) !== 'object') param = {};
       var target = ('target' in param) ? param.target : 'USER';
       var ownerUsername = ('ownerUsername') ? param.ownerUsername : false;   // 2019-03-23
@@ -860,10 +1021,18 @@ var ClsDocuskyGetDbCorpusDocumentsSimpleUI = function(param) {     // class (con
       var query = ('query' in param) ? param.query : '.all';
       var page = ('page' in param) ? param.page : 1;
       var pageSize = ('pageSize' in param) ? param.pageSize : 200;
-      var message = ('message' in param) ? param.message : ('page: ' + page);
-      var channelKey = ('channelKey' in param) ? param.channelKey: '';       // 2017-01-17
-      var fieldsOnly = ('fieldsOnly' in param) ? param.fieldsOnly: '';       // 2018-09-15
-      //alert(JSON.stringify(param));
+      var channelKey = ('channelKey' in param) ? param.channelKey: '';           // 2017-01-17
+      var fieldsOnly = ('fieldsOnly' in param) ? param.fieldsOnly: '';           // 2018-09-15
+      var requester = ('requester' in param) ? param.requester: me.requester;    // 2021-06-24
+      var message = 'page ' + page;           // 2019-07-12: default type
+
+      if ('message' in param) message = param.message;
+      else if (me.loadingIconMessageType == 0) ;
+      else if (me.loadingIconMessageType == 1) {
+         if (me.totalFound > 0) message = (page - 1) * pageSize + "/" + me.totalFound;
+         else message = "-/-";
+      }
+      else ;
 
       if (channelKey) {
          me.channelBuffer[channelKey] = {};
@@ -883,6 +1052,8 @@ var ClsDocuskyGetDbCorpusDocumentsSimpleUI = function(param) {     // class (con
       my.pageSize = pageSize;        // 2018-07-03 wayne
       my.channelKey = channelKey;    // 2018-09-14
       my.fieldsOnly = fieldsOnly;    // 2018-09-14
+      my.requester = requester;      // 2021-06-24
+      
 
       // many variables (e.g., dbCorpusListContainerId) are defined outside me function... cannot access directly?
       var dbCorpusListContainerId = me.idPrefix + "dbCorpusListContainer" + me.uniqueId;
@@ -912,10 +1083,14 @@ var ClsDocuskyGetDbCorpusDocumentsSimpleUI = function(param) {     // class (con
       //$.ajaxSetup({async:false});
       var url = me.urlGetQueryResultDocumentsJson + "?target=" + target
               + (ownerUsername ? ("&ownerUsername=" + ownerUsername) : "")
-              + "&db=" + db + "&corpus=" + corpus + "&query=" + query
+              + "&db=" + db + "&corpus=" + corpus + "&query=" + encodeURIComponent(query)    // 2021-07-02: (bug fix) 加上 encodeURIComponent()
               + "&page=" + page + "&pageSize=" + pageSize
               + (fieldsOnly ? "&fieldsOnly=" + fieldsOnly : "")    // 2018-09-14
-              + (channelKey ? "&channelKey=" + channelKey : "");
+              + (channelKey ? "&channelKey=" + channelKey : "")
+              + "&requester=" + me.requester;                      // 2021-06-24
+      url += (SessionKey) ? ("&" + SessionKey) : "";               // 2021-02-06
+      //alert(url);
+
       //var w = Math.max(document.documentElement.clientWidth, window.innerWidth || 0);      // viewport width
       //var h = Math.max(document.documentElement.clientHeight, window.innerHeight || 0);
       //var scrollX = window.pageXOffset;
@@ -936,7 +1111,7 @@ var ClsDocuskyGetDbCorpusDocumentsSimpleUI = function(param) {     // class (con
       }
       //alert(url);
 
-	   $.ajaxSetup({xhrFields: {withCredentials: true},timeout: me.maxResponseTimeout});
+	   $.ajaxSetup({xhrFields: {withCredentials: WithCredentials},timeout: me.maxResponseTimeout});
       $.get(url, function(data) {
          $("#" + loadingContainerId).hide();
          if (data.code == 0) {                               // successfully get dbCorpusDocuments
@@ -957,7 +1132,9 @@ var ClsDocuskyGetDbCorpusDocumentsSimpleUI = function(param) {     // class (con
                me.fieldsInly = (data.message.fieldsOnly !== undefined)
                              ? data.message.fieldsOnly : '';       // 2018-09-15
 
-               if (typeof me.callerCallback === "function") me.callerCallback();
+               if (typeof me.callerCallback === "function") {      // 2021-06-14
+                  me.callerCallback(data);  
+               }
             }
             else {
                // copy to object's specific variable (channel area)
@@ -983,10 +1160,11 @@ var ClsDocuskyGetDbCorpusDocumentsSimpleUI = function(param) {     // class (con
          }
          else if (data.code == 101) {             // requires login
   			   $("#" + dbCorpusListContainerId).fadeOut();
-           var jelement = $("#" + loginContainerId);
+            var jelement = $("#" + loginContainerId);
   			   jelement.fadeTo(200, 1);
   			   $("#" + loginContainerOverlayId).hide();
-           jelement.css({top: me.callerEvent.clientY, left: me.callerEvent.clientX, position:'absolute'});
+            jelement.css({top: me.callerEvent.clientY, left: me.callerEvent.clientX, position:'absolute'});
+            if (typeof failFunc === "function") failFunc(data.message);        // 2021-06-14
          }
          else if (data.code == 201) {             // requires db and corpus => display db list for user to specify
             var param = { target: target,
@@ -1007,8 +1185,8 @@ var ClsDocuskyGetDbCorpusDocumentsSimpleUI = function(param) {     // class (con
                 $("#" + dbCorpusListContainerId).fadeOut();
                 alert("Error: " + data.code + "\n" + data.message);
            }
-
-         }
+           if (typeof failFunc === "function") failFunc(data.message);        // 2021-06-14
+        }
       }, 'json')
       .fail(function (jqXHR, textStatus, errorThrown){
           if (jqXHR.status=="200") {          // 2019-05-04: server return not correct json
@@ -1104,8 +1282,10 @@ var ClsDocuskyGetDbCorpusDocumentsSimpleUI = function(param) {     // class (con
 
       // uses jquery ajax for simplicity
       var url = me.urlGetQueryPostClassificationJson + "?target=" + target
-              + "&db=" + db + "&corpus=" + corpus + "&query=" + query
-              + (fieldsOnly ? "&fieldsOnly=" + fieldsOnly : '');     // 2018-09-15
+              + "&db=" + db + "&corpus=" + corpus + "&query=" + encodeURIComponent(query)          // 2021-07-02: (bug fix) 加上 encodeURIComponent()
+              + (fieldsOnly ? "&fieldsOnly=" + fieldsOnly : '')      // 2018-09-15
+              + "&requester=" + me.requester;                        // 2021-06-24
+      url += (SessionKey) ? ("&" + SessionKey) : "";                 // 2021-02-06
 
       if (me.displayLoadingIcon) {
         if(me.callerEvent){
@@ -1120,7 +1300,7 @@ var ClsDocuskyGetDbCorpusDocumentsSimpleUI = function(param) {     // class (con
       }
 
 	   //alert("=> " + url);
-      $.ajaxSetup({xhrFields: {withCredentials: true}});
+      $.ajaxSetup({xhrFields: {withCredentials: WithCredentials}});
       $.get(url, function(data) {
          //alert(JSON.stringify(data));
          $("#" + loadingContainerId).hide();
@@ -1259,8 +1439,10 @@ var ClsDocuskyGetDbCorpusDocumentsSimpleUI = function(param) {     // class (con
       // uses jquery ajax for simplicity
       //$.ajaxSetup({async:false});
       var url = me.urlGetQueryTagAnalysisJson + "?target=" + target
-              + "&db=" + db + "&corpus=" + corpus + "&query=" + query
-              + (fieldsOnly ? "&fieldsOnly=" + fieldsOnly : '');     // 2018-09-15
+              + "&db=" + db + "&corpus=" + corpus + "&query=" + encodeURIComponent(query)          // 2021-07-02: (bug fix) 加上 encodeURIComponent()
+              + (fieldsOnly ? "&fieldsOnly=" + fieldsOnly : '')       // 2018-09-15
+              + "&requester=" + me.requester;
+      url += (SessionKey) ? ("&" + SessionKey) : "";                  // 2021-02-06
 
       if (me.displayLoadingIcon) {
           if(evt){
@@ -1274,7 +1456,7 @@ var ClsDocuskyGetDbCorpusDocumentsSimpleUI = function(param) {     // class (con
       }
 
 	   //alert(url);
-      $.ajaxSetup({xhrFields: {withCredentials: true}});
+      $.ajaxSetup({xhrFields: {withCredentials: WithCredentials}});
       $.get(url, function(data) {
          $("#" + loadingContainerId).hide();
          if (data.code == 0) {                               // successfully get dbCorpusDocuments
@@ -1392,6 +1574,35 @@ var ClsDocuskyGetDbCorpusDocumentsSimpleUI = function(param) {     // class (con
    me.setDbListOption = function(param) {                    // 2019-03-23
      if (param.includeFriendDb) me.includeFriendDb = param.includeFriendDb;
    }
+   
+   me.setLoadingIcon = function(param) {                     // 2019-07-09, 2019-07-11
+      if (typeof param === 'string' || param instanceof String) param.url = param;    // to overload the old design (only one argument url)
+      
+      // param: { hide, url, iconNumber, iconCss, iconContainerCss, loadingIconMessageType, loadingIconMessageCss }
+      var loadingContainerId = me.idPrefix + "loadingContainer" + me.uniqueId;        // or, use "div.dsw-loadingIcon"
+      if (param.hide) me.displayLoadingIcon = false;         // same effect as invoking hideLoadingIcon()
+      
+      if (param.url) {                    // 2019-04-24, 2019-07-11: use user-defined url as icon
+        $("#" + loadingContainerId + " img").attr("src", url);
+      };
+      if (param.iconNumber) {             // select icon from default icon set
+         me.loadingIconIdx = param.iconNumber;
+         let imgSrc = me.urlWebApiPath + "/images/loading/" + me.loadingIconSet[me.loadingIconIdx];
+         $("#dsLoadingIcon").attr("src", imgSrc);
+      }
+      if (param.iconCss) {
+         $("#dsLoadingIcon").css(param.iconCss);
+      }
+      if (param.iconContainerCss) {        // e.g., { 'background-color':'transparent' }
+         $("#" + loadingContainerId).css(param.iconContainerCss);
+      }
+      if (param.loadingIconMessageType) {  // 2019-07-12
+         me.loadingIconMessageType = param.loadingIconMessageType;
+      }
+      if (param.loadingIconMessageCss) {  // 2019-07-12
+         $("div.dsw-progressMessage").css(param.loadingIconMessageCss);
+      }
+   }
 
    var updateOrReplaceDoc = function(actionUrl, ownerUsername, db, corpus, docInfo, succFunc, failFunc) {
       if (docInfo['docFilename'] === undefined) {
@@ -1403,7 +1614,15 @@ var ClsDocuskyGetDbCorpusDocumentsSimpleUI = function(param) {     // class (con
       if (ownerUsername) fd.append('ownerUsername', ownerUsername);     // 2019-04-21
       fd.append('db', db);
       fd.append('corpus', corpus);
+      fd.append('requester', me.requester);                             // 2021-06-24
       fd.append('json', JSON.stringify(docInfo));
+      
+      // 2021-02-06
+      if (SessionKey) {
+         let [name, val] = SessionKey.split("=");
+         fd.append(name, val);
+      }
+
       //alert(JSON.stringify(ownerUsername));
       $.ajax({
          url: actionUrl,
@@ -1653,8 +1872,8 @@ $('head').append('<style id="dsw-simplecomboui">'
    + '.dsw-titleContainer { width:85%; padding: 0; }'
    + '.dsw-closeContainer { position: relative; text-align: right; direction: rtl; padding: 0; }'
    + '.dsw-span-listOption { cursor:pointer; background-color:#DFDFDF; color:#1F1F1F; display:inline-block; line-height:16px; white-space:nowrap; }'
-   + '.dsw-titlename { display: inline-block; line-height: 16px; white-space: nowrap; }'
-   + '.dsw-btn-close { display: inline-block; line-height: 16px; cursor: pointer; }'
+   + '.dsw-titlename { display: inline-block; line-height: 16px; white-space: nowrap; color:#DFDFDF; }'
+   + '.dsw-btn-close { display: inline-block; line-height: 16px; cursor: pointer; color:#DFDFDF; }'
    + '.dsw-btn-close:hover { background-color:#BFBFBF; color:#96438A; }'
    + '.dsw-btn-close:active { background-color:#BFBFBF; color:#96438A; }'
    + '.dsw-td-contentlist { vertical-align: middle; padding: 0.25rem;}'
@@ -1699,6 +1918,8 @@ $('head').append('<style id="dsw-simplecomboui">'
    + 'span.dsw-corpusClick { cursor:pointer; text-decoration:underline; color:blue; }'
    + 'span.dsw-attCntClick { cursor:pointer; text-decoration:underline; color:blue; }'
    + 'span.dsw-ownerUsername { background-color:darkred; color:white; border-radius:3px; padding:2px; font-size:0.8em; display:inline-block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:140px; }'
+   + 'div.dsw-loadingIcon { position:absolute; border:3px grey solid; border-radius:6px; background-color:white; font-size:medium; z-index:1003; }'
+   + 'div.dsw-progressMessage { color:#3F3F3F; }'
    + '</style>'
 );
 
